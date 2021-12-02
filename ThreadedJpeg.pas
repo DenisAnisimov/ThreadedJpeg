@@ -572,6 +572,7 @@ begin
           Thread.Terminate;
           Thread.WaitFor;
           Thread.Free;
+          raise;
         end;
       end;
 
