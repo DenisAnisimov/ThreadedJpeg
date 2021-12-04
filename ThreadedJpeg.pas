@@ -2,8 +2,11 @@ unit ThreadedJpeg;
 
 // Based on NativeJpeg (C) Simdesign BV, all rights reserved.
 
-// 1.0
+// 1.1
+// Reading of Haffman codes improved
 
+// 1.0
+// Initial release
 
 {$DEFINE SUPPORT_GRAPHICS}
 { $DEFINE SUPPORT_GRAPHICS32}
@@ -17,13 +20,13 @@ uses
   ;
 
 const
-  JPEG_OK                        = 0;
-  JPEG_UNEXPECTED_EOF            = 1;
-  JPEG_UNEXPECTED_EOI            = 2;
-  JPEG_INVALID_MARKER_FOUND      = 3;
-  JPEG_INVALID_COMRESSION_METHOD = 4;
-  JPEG_UNSUPORTED_COLOR_SPACE    = 5;
-  JPEG_DATA_ERROR                = 6;
+  JPEG_OK                            = 0;
+  JPEG_UNEXPECTED_EOF                = 1;
+  JPEG_UNEXPECTED_EOI                = 2;
+  JPEG_INVALID_MARKER_FOUND          = 3;
+  JPEG_UNSUPPORTED_COMRESSION_METHOD = 4;
+  JPEG_UNSUPPORTED_COLOR_SPACE       = 5;
+  JPEG_DATA_ERROR                    = 6;
 
 type
   TsdJpegColorSpace = (
@@ -54,24 +57,24 @@ type
   end;
   PdecDQTTable = ^TdecDQTTable;
 
-  TdecDHTValues = array[0..255] of Byte;
-
   TdecDHTValue = record
-    Count: Integer;    // Count of codec in group
+    Count: Integer;    // Count of codes in group
     MinValue: Integer; // Min Huffman code
     MaxValue: Integer; // Max Huffman code
     MinIndex: Integer; // Offset to first code
   end;
   PdecDHTValue = ^TdecDHTValue;
 
-  TdecDHTValueEx = record
-    Value: Byte;
+  TdecDHTFastValue = record
+    Value: Cardinal;
+    BitCount: Cardinal;
   end;
 
   TdecDHTTable = record
     HuffmanCodes: array[1..16] of TdecDHTValue;
-    Values_: array[0..255] of TdecDHTValueEx;
-    MinHaffmanLen: Integer;
+    Values: array[0..255] of Byte;
+    FastValues: array[0..255] of TdecDHTFastValue;
+    MinHuffmanLen: Integer;
     Inited: Boolean;
     Filled: Boolean;
   end;
@@ -296,7 +299,9 @@ type
     procedure Error(const AMessage: string; AOffset: Integer);
     {$ENDIF}
     function Read(ABuffer: PByte; ASize: Cardinal): Cardinal;
-    function ReadByte(out AByte: Byte): Cardinal; inline;
+    function ReadByte(out AByte: Byte): Cardinal; overload; inline;
+    function ReadByte(out AByte: Integer): Cardinal; overload; inline;
+    function PreviewByte(out AByte: Integer): Cardinal; inline;
     function ReadMarker(out AMarker: Byte): Cardinal;
     function ReadSize(AMarker: Byte; out ASize: Word): Cardinal;
     function ReadSegment(ASize: Word): Word;
@@ -309,22 +314,23 @@ type
     function ReadSOS(ASize: Word): Cardinal;
     function DetectColorSpace: TsdJpegColorSpace;
   private
-    FBits: Byte;
+    FBits: Integer;
     FAvailableBitCount: Integer;
+    FRealAvailableBitCount: Integer;
     procedure InitBitReaded; inline;
     procedure AfterRestart;
+    function FillBits: Cardinal;
     function ReadBit(out ABit: Integer): Cardinal; inline;
-    function DoReadBit(out ABit: Integer): Cardinal;
     function ReadBits(ACount: Integer; out ABits: Integer): Cardinal;
-    function ReadHaffman(ATable: PdecDHTTable; out AValue: Integer): Cardinal;
+    function ReadHuffman(ATable: PdecDHTTable; out AValue: Integer): Cardinal;
   private
     function GetValues(AComponentIndex, AComponentIndex2, AMCUHorzIndex, AMCUVertIndex: Integer): PdecDataUnit; //inline;
 
-    function ReadBaselineHaffmanDataUnit(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
-    function ReadProgressiveHaffmanDCBandFirst(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
-    function ReadProgressiveHaffmanDCBandNext(ADCAC: PdecDataUnit): Cardinal;
-    function ReadProgressiveHaffmanACBandFirst(var EOBRun: integer; AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
-    function ReadProgressiveHaffmanACBandNext(var EOBRun: integer; AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
+    function ReadBaselineHuffmanDataUnit(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
+    function ReadProgressiveHuffmanDCBandFirst(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
+    function ReadProgressiveHuffmanDCBandNext(ADCAC: PdecDataUnit): Cardinal;
+    function ReadProgressiveHuffmanACBandFirst(var EOBRun: integer; AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
+    function ReadProgressiveHuffmanACBandNext(var EOBRun: integer; AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
 
     procedure RSTFound(RST: Byte; var MCUHorzIndex, MCUVertIndex: Integer);
     procedure FindNextRST(var MCUHorzIndex, MCUVertIndex: Integer);
@@ -1306,7 +1312,7 @@ begin
                       FEnabledMarkers := FEnabledMarkers + [mkSOS, mkEOI];
                     end;
                 else
-                  Result := JPEG_INVALID_COMRESSION_METHOD;
+                  Result := JPEG_UNSUPPORTED_COMRESSION_METHOD;
                   {$IFDEF DEBUG}
                   Error('Compression method ' + MarkerToString(FSOF.Type_) + ' is not supported.', 0);
                   {$ENDIF}
@@ -1361,8 +1367,36 @@ begin
       Result := JPEG_OK
     end
   else
-    if Read(@AByte, SizeOf(AByte)) = SizeOf(AByte) then Result := JPEG_OK
-                                                   else Result := JPEG_UNEXPECTED_EOF;
+    if Read(@AByte, 1) = 1 then Result := JPEG_OK
+                           else Result := JPEG_UNEXPECTED_EOF;
+end;
+
+function TdecJpegImage.ReadByte(out AByte: Integer): Cardinal;
+begin
+  if FBufferAvailableSize > 0 then
+    begin
+      AByte := FBufferPos^;
+      Inc(FBufferPos);
+      Dec(FBufferAvailableSize);
+      Result := JPEG_OK
+    end
+  else
+    begin
+      AByte := 0;
+      if Read(@AByte, 1) = 1 then Result := JPEG_OK
+                             else Result := JPEG_UNEXPECTED_EOF;
+    end;
+end;
+
+function TdecJpegImage.PreviewByte(out AByte: Integer): Cardinal;
+begin
+  if FBufferAvailableSize > 0 then
+    begin
+      AByte := FBufferPos^;
+      Result := JPEG_OK;
+    end
+  else
+    Result := JPEG_DATA_ERROR;
 end;
 
 function TdecJpegImage.ReadMarker(out AMarker: Byte): Cardinal;
@@ -1635,16 +1669,19 @@ var
   TotalValueCount: Integer;
   MaxHuffmanCodeLen: Integer;
   HuffmanCode: Integer;
+  FastHuffman: Integer;
+  FastValue: Integer;
+  FastIndex: Integer;
 begin
   Result := JPEG_OK;
   if ATable.Filled then Exit;
 
-  ATable.MinHaffmanLen := 1;
+  ATable.MinHuffmanLen := 1;
 
   for HuffmanCodeLen := 1 to 16 do
     begin
       if ATable.HuffmanCodes[HuffmanCodeLen].Count > 0 then Break;
-      Inc(ATable.MinHaffmanLen);
+      Inc(ATable.MinHuffmanLen);
     end;
 
   TotalValueCount := 0;
@@ -1680,6 +1717,18 @@ begin
             end;
           ATable.HuffmanCodes[HuffmanCodeLen].MaxValue := HuffmanCode;
 
+          if HuffmanCodeLen < 9 then
+            begin
+              FastHuffman := HuffmanCode shl (8 - HuffmanCodeLen);
+              FastValue := ATable.Values[ATable.HuffmanCodes[HuffmanCodeLen].MinIndex + (HuffmanCode - ATable.HuffmanCodes[HuffmanCodeLen].MinValue)];
+              for FastIndex := 0 to (1 shl (8 - HuffmanCodeLen)) - 1 do
+                with ATable.FastValues[FastHuffman or FastIndex] do
+                  begin
+                    Value := FastValue;
+                    BitCount := HuffmanCodeLen;
+                  end;
+            end;
+
           Inc(HuffmanCode);
           Inc(TotalValueCount);
         end;
@@ -1709,16 +1758,8 @@ begin
   TableIndex := 0;
   {$ENDIF}
   Pos := FSegment;
-  {$IFDEF DEBUG}
-  //Table := nil; // Make compiler happy
-  {$ENDIF}
   while ASize > 0 do
     begin
-      (*if TableIndex = 4 then
-        begin
-          Error{$IFDEF DEBUG}('DQT section contains too much tables (' + IntToStr(TableIndex) + ').', ASize + 4){$ENDIF};
-          //Exit;
-        end;*)
       B := Pos^;
 
       Index := B and $F;
@@ -1740,7 +1781,8 @@ begin
         Exit;
         Table := nil; // Make compiler happy
       end;
-      Table.MinHaffmanLen := 1;
+      ZeroMemory(Table, SizeOf(Table^));
+      Table.MinHuffmanLen := 1;
 
       Inc(Pos);
       Dec(ASize);
@@ -1760,7 +1802,7 @@ begin
       for HuffmanCodeLen := 1 to 16 do
         begin
           if Table.HuffmanCodes[HuffmanCodeLen].Count > 0 then Break;
-          Inc(Table.MinHaffmanLen);
+          Inc(Table.MinHuffmanLen);
         end;
 
       Dec(ASize, 16);
@@ -1786,7 +1828,7 @@ begin
                   Exit;
                 end;
 
-              Table.Values_[TotalValueCount].Value := Pos^;
+              Table.Values[TotalValueCount] := Pos^;
               Inc(TotalValueCount);
               Inc(Pos);
             end;
@@ -1851,9 +1893,10 @@ begin
   if FSOF.SamplePrecision <> 8 then
     begin
       {$IFDEF DEBUG}
-      //Error('SOF.SamplePrecision value ' + IntToStr(FSOF.SamplePrecision) + ' is not supported.', ASize + 4);
+      Error('SOF.SamplePrecision value ' + IntToStr(FSOF.SamplePrecision) + ' is not supported.', ASize + 4);
       {$ENDIF}
-      //Exit;
+      Result := JPEG_UNSUPPORTED_COMRESSION_METHOD;
+      Exit;
     end;
   FSOF.ImageHeight := Swap16(PWord(Pos)^); Inc(Pos, 2);
   if FSOF.ImageHeight = 0 then
@@ -2121,9 +2164,29 @@ begin
   Result := JPEG_OK;
 end;
 
+const
+  MirrorByte: array[Byte] of Integer = (
+    $00, $80, $40, $C0, $20, $A0, $60, $E0, $10, $90, $50, $D0, $30, $B0, $70, $F0,
+    $08, $88, $48, $C8, $28, $A8, $68, $E8, $18, $98, $58, $D8, $38, $B8, $78, $F8,
+    $04, $84, $44, $C4, $24, $A4, $64, $E4, $14, $94, $54, $D4, $34, $B4, $74, $F4,
+    $0C, $8C, $4C, $CC, $2C, $AC, $6C, $EC, $1C, $9C, $5C, $DC, $3C, $BC, $7C, $FC,
+    $02, $82, $42, $C2, $22, $A2, $62, $E2, $12, $92, $52, $D2, $32, $B2, $72, $F2,
+    $0A, $8A, $4A, $CA, $2A, $AA, $6A, $EA, $1A, $9A, $5A, $DA, $3A, $BA, $7A, $FA,
+    $06, $86, $46, $C6, $26, $A6, $66, $E6, $16, $96, $56, $D6, $36, $B6, $76, $F6,
+    $0E, $8E, $4E, $CE, $2E, $AE, $6E, $EE, $1E, $9E, $5E, $DE, $3E, $BE, $7E, $FE,
+    $01, $81, $41, $C1, $21, $A1, $61, $E1, $11, $91, $51, $D1, $31, $B1, $71, $F1,
+    $09, $89, $49, $C9, $29, $A9, $69, $E9, $19, $99, $59, $D9, $39, $B9, $79, $F9,
+    $05, $85, $45, $C5, $25, $A5, $65, $E5, $15, $95, $55, $D5, $35, $B5, $75, $F5,
+    $0D, $8D, $4D, $CD, $2D, $AD, $6D, $ED, $1D, $9D, $5D, $DD, $3D, $BD, $7D, $FD,
+    $03, $83, $43, $C3, $23, $A3, $63, $E3, $13, $93, $53, $D3, $33, $B3, $73, $F3,
+    $0B, $8B, $4B, $CB, $2B, $AB, $6B, $EB, $1B, $9B, $5B, $DB, $3B, $BB, $7B, $FB,
+    $07, $87, $47, $C7, $27, $A7, $67, $E7, $17, $97, $57, $D7, $37, $B7, $77, $F7,
+    $0F, $8F, $4F, $CF, $2F, $AF, $6F, $EF, $1F, $9F, $5F, $DF, $3F, $BF, $7F, $FF);
+
 procedure TdecJpegImage.InitBitReaded;
 begin
   FAvailableBitCount := 0;
+  FRealAvailableBitCount := 0;
 end;
 
 procedure TdecJpegImage.AfterRestart;
@@ -2142,77 +2205,77 @@ begin
   Result := (AByte >= mkRST0) and (AByte <= mkRST7);
 end;
 
-function TdecJpegImage.ReadBit(out ABit: Integer): Cardinal;
+function TdecJpegImage.FillBits: Cardinal;
+var
+  NextByte: Integer;
 begin
-  if FAvailableBitCount = 0 then
-    Result := DoReadBit(ABit)
-  else
+  Result := ReadByte(FBits);
+  if Result <> JPEG_OK then
     begin
-      if FBits and $80 = 0 then ABit := 0
-                           else ABit := 1;
-      FBits := FBits shl 1;
-      Dec(FAvailableBitCount);
-      Result := JPEG_OK;
+      {$IFDEF DEBUG}
+      Error('Unexpected EOF.', 0);
+      {$ENDIF}
+      Exit;
+    end;
+
+  if FBits = $FF then
+    begin
+      //while True do
+        begin
+          Result := ReadByte(NextByte);
+          if Result <> JPEG_OK then
+            begin
+              {$IFDEF DEBUG}
+              Error('Unexpected EOF.', 0);
+              {$ENDIF}
+              Exit;
+            end;
+          //if NextByte <> $FF then Break;
+        end;
+      if NextByte <> 0 then
+        begin
+          if (FRestartInterval > 0) and IsRSTMarker(NextByte) then
+            Result := NextByte
+          else
+          if FUnknownHeight and (NextByte = mkDNL) then
+            Result := NextByte
+          else
+            if NextByte = $D9 then
+              Result := JPEG_UNEXPECTED_EOI
+            else
+              Result := JPEG_DATA_ERROR;
+          Exit;
+        end;
+    end;
+
+  FBits := FBits shl 8;
+  FAvailableBitCount := 8;
+  FRealAvailableBitCount := 8;
+  if (PreviewByte(NextByte) = JPEG_OK) and (NextByte <> $FF) then
+    begin
+      FBits := FBits or NextByte;
+      FRealAvailableBitCount := 16;
     end;
 end;
 
-function TdecJpegImage.DoReadBit(out ABit: Integer): Cardinal;
-var
-  NextByte: Byte;
+function TdecJpegImage.ReadBit(out ABit: Integer): Cardinal;
 begin
   if FAvailableBitCount = 0 then
     begin
-      Result := ReadByte(FBits);
-      if Result <> JPEG_OK then
-        begin
-          {$IFDEF DEBUG}
-          Error('Unexpected EOF.', 0);
-          {$ENDIF}
-          Exit;
-        end;
-
-      if FBits = $FF then
-        begin
-          //while True do
-            begin
-              Result := ReadByte(NextByte);
-              if Result <> JPEG_OK then
-                begin
-                  {$IFDEF DEBUG}
-                  Error('Unexpected EOF.', 0);
-                  {$ENDIF}
-                  Exit;
-                end;
-              //if NextByte <> $FF then Break;
-            end;
-          if NextByte <> 0 then
-            begin
-              if (FRestartInterval > 0) and IsRSTMarker(NextByte) then
-                Result := NextByte
-              else
-              if FUnknownHeight and (NextByte = mkDNL) then
-                Result := NextByte
-              else
-                if NextByte = $D9 then
-                  Result := JPEG_UNEXPECTED_EOI
-                else
-                  Result := JPEG_DATA_ERROR;
-              Exit;
-            end;
-        end;
-
-      FAvailableBitCount := 8;
+      Result := FillBits;
+      if Result <> JPEG_OK then Exit;
     end;
-  if FBits and $80 = 0 then ABit := 0
-                       else ABit := 1;
-  FBits := FBits shl 1;
+
+  if FBits and $8000 = 0 then ABit := 0
+                         else ABit := 1;
+  FBits := (FBits shl 1) and $FFFF;
   Dec(FAvailableBitCount);
+  Dec(FRealAvailableBitCount);
   Result := JPEG_OK;
 end;
 
 function TdecJpegImage.ReadBits(ACount: Integer; out ABits: Integer): Cardinal;
 var
-  NextByte: Byte;
   Bit: Integer;
   CopyCount: Integer;
 begin
@@ -2226,53 +2289,16 @@ begin
     begin
       if FAvailableBitCount = 0 then
         begin
-          Result := ReadByte(FBits);
-          if Result <> JPEG_OK then
-            begin
-              {$IFDEF DEBUG}
-              Error('Unexpected EOF.', 0);
-              {$ENDIF}
-              Exit;
-            end;
-
-          if FBits = $FF then
-            begin
-              //while True do
-                begin
-                  Result := ReadByte(NextByte);
-                  if Result <> JPEG_OK then
-                    begin
-                      {$IFDEF DEBUG}
-                      Error('Unexpected EOF.', 0);
-                      {$ENDIF}
-                      Exit;
-                    end;
-                  //if NextByte <> $FF then Break;
-                end;
-              if NextByte <> 0 then
-                begin
-                  if (FRestartInterval > 0) and IsRSTMarker(NextByte) then
-                    Result := NextByte
-                  else
-                  if FUnknownHeight and (NextByte = mkDNL) then
-                    Result := NextByte
-                  else
-                    if NextByte = $D9 then
-                      Result := JPEG_UNEXPECTED_EOI
-                    else
-                      Result := JPEG_DATA_ERROR;
-                  Exit;
-                end;
-            end;
-
-          FAvailableBitCount := 8;
+          Result := FillBits;
+          if Result <> JPEG_OK then Exit;
         end;
 
       if ACount > FAvailableBitCount then CopyCount := FAvailableBitCount
                                      else CopyCount := ACount;
-      Bit := FBits shr (8 - CopyCount);
-      FBits := FBits shl CopyCount;
+      Bit := FBits shr (16 - CopyCount);
+      FBits := (FBits shl CopyCount) and $FFFF;
       Dec(FAvailableBitCount, CopyCount);
+      Dec(FRealAvailableBitCount, CopyCount);
 
       ABits := (ABits shl CopyCount) or Bit;
       Dec(ACount, CopyCount);
@@ -2280,33 +2306,88 @@ begin
   Result := JPEG_OK;
 end;
 
-function TdecJpegImage.ReadHaffman(ATable: PdecDHTTable; out AValue: Integer): Cardinal;
+function TdecJpegImage.ReadHuffman(ATable: PdecDHTTable; out AValue: Integer): Cardinal;
 var
-  HaffmanCode: Integer;
-  HaffmanCodeLen: Integer;
+  FastValueIndex: Integer;
+  FastSkip: Integer;
+  NextByte: Integer;
+  HuffmanCode: Integer;
+  HuffmanCodeLen: Integer;
   Bit: Integer;
   DHTValue: PdecDHTValue;
   Delta: Integer;
 begin
-  HaffmanCodeLen := ATable.MinHaffmanLen;
-  if HaffmanCodeLen = 1 then Result := ReadBit(HaffmanCode)
-                        else Result := ReadBits(HaffmanCodeLen, HaffmanCode);
+  HuffmanCodeLen := ATable.MinHuffmanLen;
+
+  if (FAvailableBitCount = 0) and (FRealAvailableBitCount < 8) then
+    begin
+      Result := FillBits;
+      if Result <> JPEG_OK then Exit;
+    end;
+
+  if FRealAvailableBitCount >= 8 then
+    begin
+      FastValueIndex := FBits shr 8;
+      if ATable.FastValues[FastValueIndex].BitCount <> 0 then
+        begin
+          AValue := ATable.FastValues[FastValueIndex].Value;
+          FastSkip := ATable.FastValues[FastValueIndex].BitCount;
+          while FastSkip > 0 do
+            begin
+              if FAvailableBitCount = 0 then
+                begin
+                  ReadByte(FBits);
+                  FBits := FBits shl 8;
+                  FAvailableBitCount := 8;
+                  FRealAvailableBitCount := 8;
+                  if (PreviewByte(NextByte) = JPEG_OK) and (NextByte <> $FF) then
+                    begin
+                      FBits := FBits or NextByte;
+                      FRealAvailableBitCount := 16;
+                    end;
+                end;
+
+              if FAvailableBitCount > 0 then
+                begin
+                  if FAvailableBitCount >= FastSkip then
+                    begin
+                      FBits := (FBits shl FastSkip) and $FFFF;
+                      Dec(FAvailableBitCount, FastSkip);
+                      Dec(FRealAvailableBitCount, FastSkip);
+                      FastSkip := 0;
+                    end
+                  else
+                    begin
+                      Dec(FastSkip, FAvailableBitCount);
+                      Dec(FRealAvailableBitCount, FAvailableBitCount);
+                      FAvailableBitCount := 0;
+                    end;
+                end;
+            end;
+
+          Result := JPEG_OK;
+          Exit;
+        end;
+    end;
+
+  if HuffmanCodeLen = 1 then Result := ReadBit(HuffmanCode)
+                        else Result := ReadBits(HuffmanCodeLen, HuffmanCode);
   if Result <> JPEG_OK then Exit;
 
   while True do
     begin
-      DHTValue := @ATable.HuffmanCodes[HaffmanCodeLen];
-      if (DHTValue.Count > 0) and (HaffmanCode <= DHTValue.MaxValue) then
+      DHTValue := @ATable.HuffmanCodes[HuffmanCodeLen];
+      if (DHTValue.Count > 0) and (HuffmanCode <= DHTValue.MaxValue) then
         begin
-          Delta := HaffmanCode - DHTValue.MinValue;
-          AValue := ATable.Values_[DHTValue.MinIndex + Delta].Value;
+          Delta := HuffmanCode - DHTValue.MinValue;
+          AValue := ATable.Values[DHTValue.MinIndex + Delta];
           Break;
         end;
 
       Result := ReadBit(Bit);
       if Result <> JPEG_OK then Exit;
 
-      if HaffmanCodeLen = 16 then
+      if HuffmanCodeLen = 16 then
         begin
           Result := JPEG_DATA_ERROR;
           {$IFDEF DEBUG}
@@ -2315,8 +2396,8 @@ begin
           Exit;
         end;
 
-      HaffmanCode := (HaffmanCode shl 1) or Bit;
-      Inc(HaffmanCodeLen);
+      HuffmanCode := (HuffmanCode shl 1) or Bit;
+      Inc(HuffmanCodeLen);
     end;
 end;
 
@@ -2330,7 +2411,7 @@ begin
   {$IFDEF DEBUG}
   CurrentPos := GetCurrentPos;
   {$ENDIF}
-  Result := ReadHaffman(ATable, ADCLen);
+  Result := ReadHuffman(ATable, ADCLen);
   if Result <> JPEG_OK then Exit;
 
   ADC := 0;
@@ -2347,7 +2428,7 @@ begin
   {$IFDEF DEBUG}
   CurrentPos := GetCurrentPos;
   {$ENDIF}
-  Result := ReadHaffman(ATable, AACLen);
+  Result := ReadHuffman(ATable, AACLen);
   if Result <> JPEG_OK then Exit;
 
   AZeroCount := AACLen shr 4;
@@ -2486,7 +2567,7 @@ begin
   end;
 end;
 
-function TdecJpegImage.ReadBaselineHaffmanDataUnit(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
+function TdecJpegImage.ReadBaselineHuffmanDataUnit(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
 var
   Table: PdecDHTTable;
   DCLen, DC: Integer;
@@ -2497,7 +2578,7 @@ var
 begin
   Table := @FDC_DHTTables[FSOS.Components[AComponentIndex].DHT_DCTableIndex];
 
-  Result := ReadHaffman(Table, DCLen);
+  Result := ReadHuffman(Table, DCLen);
   if Result <> JPEG_OK then Exit;
   DC := 0;
   if DCLen > 0 then
@@ -2518,7 +2599,7 @@ begin
   ACCount := 1;
   while ACCount < 64 do
     begin
-      Result := ReadHaffman(Table, ACLen);
+      Result := ReadHuffman(Table, ACLen);
       if Result <> JPEG_OK then Exit;
       ZeroCount := ACLen shr 4;
       ACLen := ACLen and $F;
@@ -2566,7 +2647,7 @@ begin
     end;
 end;
 
-function TdecJpegImage.ReadProgressiveHaffmanDCBandFirst(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
+function TdecJpegImage.ReadProgressiveHuffmanDCBandFirst(AComponentIndex: Integer; ADCAC: PdecDataUnit): Cardinal;
 var
   Table: PdecDHTTable;
   DCLen, DC: Integer;
@@ -2574,7 +2655,7 @@ var
 begin
   Table := @FDC_DHTTables[FSOS.Components[AComponentIndex].DHT_DCTableIndex];
 
-  Result := ReadHaffman(Table, DCLen);
+  Result := ReadHuffman(Table, DCLen);
   if Result <> JPEG_OK then Exit;
   DC := 0;
   if DCLen > 0 then
@@ -2592,7 +2673,7 @@ begin
   Component.PrevDC := DC;
 end;
 
-function TdecJpegImage.ReadProgressiveHaffmanDCBandNext(ADCAC: PdecDataUnit): Cardinal;
+function TdecJpegImage.ReadProgressiveHuffmanDCBandNext(ADCAC: PdecDataUnit): Cardinal;
 var
   Plus: integer;
   Value: Psmallint;
@@ -2608,7 +2689,7 @@ begin
                   else Dec(Value^, Plus);
 end;
 
-function TdecJpegImage.ReadProgressiveHaffmanACBandFirst(var EOBRun: integer; AComponentIndex: Integer;
+function TdecJpegImage.ReadProgressiveHuffmanACBandFirst(var EOBRun: integer; AComponentIndex: Integer;
   ADCAC: PdecDataUnit): Cardinal;
 var
   Table: PdecDHTTable;
@@ -2627,7 +2708,7 @@ begin
   ACCount := FSOS.SpectralStart;
   while ACCount <= FSOS.SpectralEnd do
     begin
-      Result := ReadHaffman(Table, ACLen);
+      Result := ReadHuffman(Table, ACLen);
       if Result <> JPEG_OK then Exit;
       ZeroCount := ACLen shr 4;
       ACLen := ACLen and $F;
@@ -3037,21 +3118,21 @@ begin
                 case FSOF.Type_ of
                   mkSOF0, mkSOF1:
                     begin
-                      Result := ReadBaselineHaffmanDataUnit(ComponentIndex, Values);
+                      Result := ReadBaselineHuffmanDataUnit(ComponentIndex, Values);
                     end;
                   mkSOF2:
                     if IsDCBand then
                       if IsFirst then
-                        Result := ReadProgressiveHaffmanDCBandFirst(ComponentIndex, Values)
+                        Result := ReadProgressiveHuffmanDCBandFirst(ComponentIndex, Values)
                       else
-                        Result := ReadProgressiveHaffmanDCBandNext(Values)
+                        Result := ReadProgressiveHuffmanDCBandNext(Values)
                     else
                       if IsFirst then
-                        Result := ReadProgressiveHaffmanACBandFirst(EOBRun, ComponentIndex, Values)
+                        Result := ReadProgressiveHuffmanACBandFirst(EOBRun, ComponentIndex, Values)
                       else
-                        Result := ReadProgressiveHaffmanACBandNext(EOBRun, ComponentIndex, Values);
+                        Result := ReadProgressiveHuffmanACBandNext(EOBRun, ComponentIndex, Values);
                 else
-                  Result := JPEG_INVALID_COMRESSION_METHOD;
+                  Result := JPEG_UNSUPPORTED_COMRESSION_METHOD;
                   Exit;
                 end;
 
@@ -3149,7 +3230,7 @@ begin
   Result := JPEG_OK;
 end;
 
-function TdecJpegImage.ReadProgressiveHaffmanACBandNext(var EOBRun: integer; AComponentIndex: Integer;
+function TdecJpegImage.ReadProgressiveHuffmanACBandNext(var EOBRun: integer; AComponentIndex: Integer;
   ADCAC: PdecDataUnit): Cardinal;
 var
   Table: PdecDHTTable;
@@ -3169,12 +3250,8 @@ begin
     Table := @FAC_DHTTables[FSOS.Components[AComponentIndex].DHT_ACTableIndex];
     while k <= FSOS.SpectralEnd do
     begin
-      //p := GetCurrentPos;
-
-      Result := ReadHaffman(Table, RS);
+      Result := ReadHuffman(Table, RS);
       if Result <> JPEG_OK then Exit;
-
-      //p := GetCurrentPos;
 
       R := RS shr 4;
       S := RS and $0F;
